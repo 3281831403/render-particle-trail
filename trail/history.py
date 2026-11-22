@@ -16,17 +16,52 @@ history, particle or segment objects supplied by the caller.
 
 from __future__ import annotations
 
+import math
+from numbers import Real
+
 
 class TrailError(ValueError):
     """Raised when trail input is invalid or cannot be rendered safely."""
 
 
+def _is_number(value):
+    """Return True for real numeric values (booleans excluded)."""
+    return isinstance(value, Real) and not isinstance(value, bool)
+
+
+def _is_finite(value):
+    """Return True for finite real numeric values."""
+    return _is_number(value) and math.isfinite(value)
+
+
+def _is_valid_pos(pos):
+    """Return True for a finite ``(x, y)`` pair."""
+    return (
+        isinstance(pos, (tuple, list))
+        and len(pos) == 2
+        and _is_finite(pos[0])
+        and _is_finite(pos[1])
+    )
+
+
+def _is_positive_int(value):
+    """Return True for positive integers (booleans excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def push(history, particles, max_len):
     """Append one live-particle snapshot, keeping at most ``max_len`` frames.
 
-    The returned history is ordered oldest first and newest last.  When the
-    new history is too long, the oldest frames are discarded, so the newest
-    frame is always retained.  The input ``history`` is not modified.
+    The returned history is ordered oldest first and newest last, and always
+    ends with the newly appended snapshot.  One slot is reserved for it by
+    discarding the oldest retained frame (FIFO), so the newest frame is always
+    retained.
+
+    An input that is already longer than ``max_len`` is reconciled to the
+    budget first: its stale tail frame is discarded together with the excess,
+    so pushing onto an over-long history never grows beyond ``max_len`` and
+    never resurrects frames outside the budget window.  The input ``history``
+    is not modified.
 
     If no particle in ``particles`` is alive, the existing (already capped)
     history is returned unchanged instead of appending an empty frame.
@@ -52,7 +87,31 @@ def push(history, particles, max_len):
         If ``max_len`` is not a positive integer, or a live particle has a
         malformed position.
     """
-    raise NotImplementedError("push is not implemented")
+    if not _is_positive_int(max_len):
+        raise TrailError("max_len must be a positive integer")
+
+    snapshot = {}
+    for particle in particles:
+        if particle.get("alive") is not True:
+            continue
+        pos = particle.get("pos")
+        if not _is_valid_pos(pos):
+            raise TrailError("live particle has a malformed position")
+        snapshot[particle["id"]] = (pos[0], pos[1])
+
+    if not snapshot:
+        return history
+
+    # Reconcile an over-long input to the budget first: if the history already
+    # exceeds max_len, the stale tail falls outside the budget window and is
+    # discarded along with the excess.
+    if len(history) > max_len:
+        budgeted = history[len(history) - max_len : -1]
+    else:
+        # Reserve one slot for the incoming snapshot (FIFO).
+        budgeted = history[-(max_len - 1):] if max_len > 1 else []
+
+    return [*budgeted, snapshot]
 
 
 def break_on_teleport(history, max_dist):
@@ -86,7 +145,32 @@ def break_on_teleport(history, max_dist):
     TrailError
         If ``max_dist`` is negative, non-finite, or not a real number.
     """
-    raise NotImplementedError("break_on_teleport is not implemented")
+    if not _is_number(max_dist) or not math.isfinite(max_dist) or max_dist < 0:
+        raise TrailError("max_dist must be a non-negative finite number")
+
+    if not history:
+        return []
+
+    runs = [[history[0]]]
+    for i in range(1, len(history)):
+        prev_frame = history[i - 1]
+        cur_frame = history[i]
+        split = False
+        for pid, pos in cur_frame.items():
+            if pid not in prev_frame:
+                continue
+            prev_pos = prev_frame[pid]
+            displacement = math.hypot(
+                pos[0] - prev_pos[0], pos[1] - prev_pos[1]
+            )
+            if displacement > max_dist:
+                split = True
+                break
+        if split:
+            runs.append([cur_frame])
+        else:
+            runs[-1].append(cur_frame)
+    return runs
 
 
 def fade_alpha(index, length, mode):
@@ -121,7 +205,24 @@ def fade_alpha(index, length, mode):
         If ``length`` is not positive, ``index`` is outside the trail, or
         ``mode`` is unknown.
     """
-    raise NotImplementedError("fade_alpha is not implemented")
+    if not _is_positive_int(length):
+        raise TrailError("length must be a positive integer")
+    if not isinstance(index, int) or isinstance(index, bool) or not (
+        0 <= index < length
+    ):
+        raise TrailError("index must satisfy 0 <= index < length")
+    if mode not in ("linear", "quad"):
+        raise TrailError(f"unknown fade mode: {mode!r}")
+
+    if length == 1:
+        factor = 1.0
+    else:
+        # Head (index 0) -> 1.0, tail (index length - 1) -> 0.0.
+        factor = 1.0 - index / (length - 1)
+
+    if mode == "quad":
+        return factor * factor
+    return factor
 
 
 def build_ribbon(history, width):
@@ -167,7 +268,92 @@ def build_ribbon(history, width):
     TrailError
         If ``width`` is not positive and finite.
     """
-    raise NotImplementedError("build_ribbon is not implemented")
+    if not _is_finite(width) or width <= 0:
+        raise TrailError("width must be a positive finite number")
+
+    # Collect each id's samples oldest first, remembering first-seen order.
+    samples = {}
+    id_order = []
+    for frame in history:
+        for pid, pos in frame.items():
+            if pid not in samples:
+                samples[pid] = []
+                id_order.append(pid)
+            samples[pid].append((pos[0], pos[1]))
+
+    half_width = width / 2.0
+    ribbons = {}
+    for pid in id_order:
+        points = samples[pid]
+        count = len(points)
+        normals = []
+        prev_normal = None
+
+        for i in range(count):
+            x, y = points[i]
+            if count == 1:
+                dx = dy = 0.0
+            elif i == 0:
+                # Forward tangent at the first point.
+                dx = points[1][0] - x
+                dy = points[1][1] - y
+            elif i == count - 1:
+                # Backward tangent at the last point.
+                dx = x - points[i - 1][0]
+                dy = y - points[i - 1][1]
+            else:
+                # Central tangent everywhere else.
+                dx = points[i + 1][0] - points[i - 1][0]
+                dy = points[i + 1][1] - points[i - 1][1]
+
+            tangent_len = math.hypot(dx, dy)
+            if tangent_len == 0.0:
+                # Stationary/duplicate point: reuse the previous normal.
+                normal = prev_normal if prev_normal is not None else (1.0, 0.0)
+            else:
+                nx = -dy / tangent_len
+                ny = dx / tangent_len
+                # Keep adjacent normals on the same side of the ribbon.
+                if prev_normal is not None and (
+                    nx * prev_normal[0] + ny * prev_normal[1] < 0.0
+                ):
+                    nx, ny = -nx, -ny
+                normal = (nx, ny)
+
+            normals.append(normal)
+            prev_normal = normal
+
+        # Points run oldest -> newest, while fade_alpha index 0 is the
+        # newest: mirror the index so the head (last point) is opaque and
+        # the tail (first point) fades to zero.
+        alphas = [
+            fade_alpha(count - 1 - i, count, "linear") for i in range(count)
+        ]
+        left = [
+            (
+                points[i][0] + normals[i][0] * half_width,
+                points[i][1] + normals[i][1] * half_width,
+            )
+            for i in range(count)
+        ]
+        right = [
+            (
+                points[i][0] - normals[i][0] * half_width,
+                points[i][1] - normals[i][1] * half_width,
+            )
+            for i in range(count)
+        ]
+
+        ribbons[pid] = {
+            "points": points,
+            "normals": normals,
+            "alphas": alphas,
+            "left": left,
+            "right": right,
+            "width": width,
+        }
+
+    return ribbons
 
 
 def dedupe_points(history, eps):
@@ -197,7 +383,25 @@ def dedupe_points(history, eps):
     TrailError
         If ``eps`` is negative, non-finite, or not a real number.
     """
-    raise NotImplementedError("dedupe_points is not implemented")
+    if not _is_number(eps) or not math.isfinite(eps) or eps < 0:
+        raise TrailError("eps must be a non-negative finite number")
+
+    last_kept = {}
+    result = []
+    for frame in history:
+        filtered = {}
+        for pid, pos in frame.items():
+            if pid not in last_kept:
+                filtered[pid] = pos
+                last_kept[pid] = pos
+                continue
+            last_x, last_y = last_kept[pid]
+            if math.hypot(pos[0] - last_x, pos[1] - last_y) > eps:
+                filtered[pid] = pos
+                last_kept[pid] = pos
+        if filtered:
+            result.append(filtered)
+    return result
 
 
 def depth_sort(segments, camera):
@@ -227,7 +431,20 @@ def depth_sort(segments, camera):
     TrailError
         If ``camera`` or a segment center is malformed or non-finite.
     """
-    raise NotImplementedError("depth_sort is not implemented")
+    if not _is_valid_pos(camera):
+        raise TrailError("camera must be a finite (x, y) position")
+
+    ordered = list(segments)
+    for segment in ordered:
+        if not _is_valid_pos(segment.get("center")):
+            raise TrailError("segment center must be a finite (x, y) position")
+
+    def squared_distance(segment):
+        cx, cy = segment["center"]
+        return (cx - camera[0]) ** 2 + (cy - camera[1]) ** 2
+
+    # Python's sort is stable: equal distances keep their input order.
+    return sorted(ordered, key=lambda segment: -squared_distance(segment))
 
 
 def validate(history, max_len):
@@ -259,7 +476,23 @@ def validate(history, max_len):
     list[str]
         Issue codes in the order described above.
     """
-    raise NotImplementedError("validate is not implemented")
+    if not _is_positive_int(max_len):
+        return ["invalid_max_len"]
+
+    issues = []
+    for frame in history:
+        if not frame and "empty_frame" not in issues:
+            issues.append("empty_frame")
+        for pos in frame.values():
+            if not _is_valid_pos(pos):
+                if "nan_position" not in issues:
+                    issues.append("nan_position")
+                break
+
+    if len(history) > max_len and "length_exceeded" not in issues:
+        issues.append("length_exceeded")
+
+    return issues
 
 
 def trail_batch(emitters, config):
@@ -296,4 +529,55 @@ def trail_batch(emitters, config):
         If the configuration is invalid, an emitter is malformed, an id is
         duplicated, or any history fails :func:`validate`.
     """
-    raise NotImplementedError("trail_batch is not implemented")
+    try:
+        max_len = config["max_len"]
+        width = config["width"]
+        eps = config["eps"]
+    except (KeyError, TypeError) as exc:
+        raise TrailError(
+            "config must provide max_len, width and eps"
+        ) from exc
+
+    if not _is_positive_int(max_len):
+        raise TrailError("config max_len must be a positive integer")
+    if not _is_finite(width) or width <= 0:
+        raise TrailError("config width must be a positive finite number")
+    if not _is_number(eps) or not math.isfinite(eps) or eps < 0:
+        raise TrailError("config eps must be a non-negative finite number")
+
+    try:
+        emitter_list = list(emitters)
+    except TypeError as exc:
+        raise TrailError("emitters must be an iterable") from exc
+
+    # Validate everything before building anything, so failure is
+    # all-or-nothing and no partial result is ever produced.
+    seen_ids = set()
+    for emitter in emitter_list:
+        try:
+            emitter_id = emitter["id"]
+            history = emitter["history"]
+        except (KeyError, TypeError) as exc:
+            raise TrailError(
+                "each emitter must contain 'id' and 'history'"
+            ) from exc
+        try:
+            if emitter_id in seen_ids:
+                raise TrailError(f"duplicate emitter id: {emitter_id!r}")
+            seen_ids.add(emitter_id)
+        except TypeError as exc:
+            raise TrailError("emitter id must be hashable") from exc
+
+        issues = validate(history, max_len)
+        if issues:
+            raise TrailError(
+                f"emitter {emitter_id!r} has invalid history: {issues}"
+            )
+
+    # Each emitter gets its own dedupe pass and ribbon build; histories are
+    # never shared or mutated.
+    result = {}
+    for emitter in emitter_list:
+        cleaned_history = dedupe_points(emitter["history"], eps)
+        result[emitter["id"]] = build_ribbon(cleaned_history, width)
+    return result
